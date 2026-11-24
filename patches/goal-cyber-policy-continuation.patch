@@ -1,0 +1,431 @@
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_goal_empty_responses.rs b/codex-rs/app-server/tests/suite/v2/thread_goal_empty_responses.rs
+index c490a9a1593367d1667b2f0b1e50011a5db72b49..331e8bdba4c0ad69c5eaedcd737209620bc49c75 100644
+--- a/codex-rs/app-server/tests/suite/v2/thread_goal_empty_responses.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_goal_empty_responses.rs
+@@ -27,6 +27,74 @@ use tempfile::TempDir;
+ use tokio::time::Duration;
+ use tokio::time::timeout;
+ 
++#[tokio::test]
++async fn cyber_policy_error_continues_an_active_goal_with_daybreak_enabled() -> Result<()> {
++    let server = create_mock_responses_server_sequence(vec![
++        responses::sse_failed(
++            "cyber-policy",
++            "cyber_policy",
++            "This request was flagged for cyber policy.",
++        ),
++        responses::sse(vec![
++            responses::ev_response_created("complete-goal"),
++            responses::ev_function_call(
++                "complete-goal-call",
++                "update_goal",
++                r#"{"status":"complete"}"#,
++            ),
++            responses::ev_completed("complete-goal"),
++        ]),
++        responses::sse(vec![
++            responses::ev_response_created("final"),
++            responses::ev_assistant_message("final-message", "Goal complete."),
++            responses::ev_completed("final"),
++        ]),
++    ])
++    .await;
++    let codex_home = TempDir::new()?;
++    MockResponsesConfig::new(&server.uri())
++        .with_model("gpt-5.4")
++        .enable_feature(Feature::Goals)
++        .write(codex_home.path())?;
++    let mut mcp = TestAppServer::builder()
++        .with_codex_home(codex_home.path())
++        .without_managed_config()
++        .build_initialized()
++        .await?;
++    let request = mcp
++        .send_thread_start_request_with_auto_env(ThreadStartParams {
++            daybreak_enabled: Some(true),
++            ..Default::default()
++        })
++        .await?;
++    let ThreadStartResponse { thread, .. } = mcp.read_response(request).await?;
++    assert_eq!(Some(true), thread.daybreak_enabled);
++    let request = mcp
++        .send_raw_request(
++            "thread/goal/set",
++            Some(json!({"threadId": thread.id, "objective": "Finish the work"})),
++        )
++        .await?;
++    let _: ThreadGoalSetResponse = mcp.read_response(request).await?;
++
++    let failed: TurnCompletedNotification = timeout(
++        Duration::from_secs(30),
++        mcp.read_notification("turn/completed"),
++    )
++    .await??;
++    assert_eq!(TurnStatus::Failed, failed.turn.status);
++
++    let continued: TurnCompletedNotification = timeout(
++        Duration::from_secs(30),
++        mcp.read_notification("turn/completed"),
++    )
++    .await??;
++    assert_eq!(TurnStatus::Completed, continued.turn.status);
++
++    server.verify().await;
++    Ok(())
++}
++
+ #[test_case::test_case(None; "empty")]
+ #[test_case::test_case(Some("final_answer"); "draft")]
+ #[test_case::test_case(Some("commentary"); "commentary")]
+diff --git a/codex-rs/ext/goal/src/extension.rs b/codex-rs/ext/goal/src/extension.rs
+index d534ec098ad79b8fb4ac4121f20e73c9e1ca15d0..e9290043b69779e84e3b0a697242113ee6914e97 100644
+--- a/codex-rs/ext/goal/src/extension.rs
++++ b/codex-rs/ext/goal/src/extension.rs
+@@ -30,6 +30,7 @@ use codex_extension_api::TurnStopInput;
+ use codex_otel::MetricsClient;
+ use codex_protocol::ThreadId;
+ use codex_protocol::items::TurnItem;
++use codex_protocol::protocol::CodexErrorInfo;
+ use codex_protocol::protocol::SessionSource;
+ use codex_protocol::protocol::SubAgentSource;
+ use codex_protocol::protocol::ThreadGoalStatus;
+@@ -425,6 +426,14 @@ where
+                 return;
+             };
+ 
++            // A cyber-policy rejection terminates the current model request, but it should not
++            // terminate an active long-running goal. Leaving the goal active lets the ordinary
++            // thread-idle lifecycle start the next goal continuation without manufacturing a
++            // visible user `continue` message. Threads without an active goal are unaffected.
++            if input.error == CodexErrorInfo::CyberPolicy {
++                return;
++            }
++
+             let reason = if input.error.is_usage_limit() {
+                 ActiveGoalStopReason::UsageLimit
+             } else {
+diff --git a/codex-rs/ext/goal/tests/goal_extension_backend.rs b/codex-rs/ext/goal/tests/goal_extension_backend.rs
+index 8faa045d7e02402df53fe4a574469150440fa19a..0eecd4d53062ceab2508817882ff0fdb9aa17228 100644
+--- a/codex-rs/ext/goal/tests/goal_extension_backend.rs
++++ b/codex-rs/ext/goal/tests/goal_extension_backend.rs
+@@ -40,6 +40,7 @@ use codex_protocol::config_types::CollaborationMode;
+ use codex_protocol::config_types::ModeKind;
+ use codex_protocol::config_types::Settings;
+ use codex_protocol::error::CodexErr;
++use codex_protocol::error::CodexErrorDetails;
+ use codex_protocol::protocol::Event;
+ use codex_protocol::protocol::EventMsg;
+ use codex_protocol::protocol::SessionSource;
+@@ -870,6 +871,42 @@ async fn turn_error_blocks_goal() -> anyhow::Result<()> {
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn cyber_policy_error_keeps_goal_active_for_idle_continuation() -> anyhow::Result<()> {
++    let runtime = test_runtime().await?;
++    let thread_id = test_thread_id()?;
++    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
++    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
++    harness.start_turn("turn-1", &TokenUsage::default()).await;
++
++    let tools = harness.tools();
++    tool_by_name(&tools, "create_goal")
++        .handle(tool_call(
++            "create_goal",
++            "call-create-goal",
++            json!({ "objective": "ship goal extension backend" }),
++        ))
++        .await?;
++
++    harness
++        .notify_turn_error(
++            "turn-1",
++            CodexErr::new(CodexErrorDetails::CyberPolicy {
++                message: "synthetic cyber policy rejection".to_string(),
++            }),
++        )
++        .await;
++    harness.stop_turn("turn-1").await;
++
++    let goal = runtime
++        .thread_goals()
++        .get_thread_goal(thread_id)
++        .await?
++        .ok_or_else(|| anyhow::anyhow!("goal should exist"))?;
++    assert_eq!(codex_state::ThreadGoalStatus::Active, goal.status);
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn failed_execution_turns_block_goal_unless_a_tool_succeeds() -> anyhow::Result<()> {
+     for (recovery_turn, status_only_turn, blocking_turn) in
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index bbc8ca19fdc8b36d0c79e813a1bf0d0e9afdd5a7..28ac2484e1b72c00cc74b43c7d970dde39babe11 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -817,6 +817,8 @@ pub(crate) struct ChatWidget {
+     // Current thread-goal status shown in the status line when plan mode is inactive.
+     current_goal_status_indicator: Option<GoalStatusIndicator>,
+     current_goal_status: Option<GoalStatusState>,
++    // Keep the Daybreak picker informational while an active goal continues in the background.
++    active_goal_cyber_policy_picker_shown: bool,
+     external_editor_state: ExternalEditorState,
+     last_rendered_user_message_display: Option<UserMessageDisplay>,
+     last_rendered_user_message_client_id: Option<String>,
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index 1e4a4cd4ab0fcb1632e115beac6c5a88123bf562..2dcf9d2bb287c105c3b95fb17132cabbd474228a 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -318,6 +318,7 @@ impl ChatWidget {
+             thread_usage: thread_usage::ThreadUsageState::default(),
+             current_goal_status_indicator: None,
+             current_goal_status: None,
++            active_goal_cyber_policy_picker_shown: false,
+             external_editor_state: ExternalEditorState::Closed,
+             last_rendered_user_message_display: None,
+             last_rendered_user_message_client_id: None,
+diff --git a/codex-rs/tui/src/chatwidget/goal_menu.rs b/codex-rs/tui/src/chatwidget/goal_menu.rs
+index e8bfa62b23241230c931fce4dde3462d4515f7e4..f79b287cc02f5e43198d713bd627f96a18b12a2d 100644
+--- a/codex-rs/tui/src/chatwidget/goal_menu.rs
++++ b/codex-rs/tui/src/chatwidget/goal_menu.rs
+@@ -77,6 +77,7 @@ impl ChatWidget {
+             .is_some_and(|active_thread_id| active_thread_id.to_string() == thread_id)
+         {
+             self.current_goal_status = None;
++            self.active_goal_cyber_policy_picker_shown = false;
+             self.update_collaboration_mode_indicator();
+         }
+     }
+diff --git a/codex-rs/tui/src/chatwidget/goal_status.rs b/codex-rs/tui/src/chatwidget/goal_status.rs
+index e64c5be376745dae998939b26ccc95cfe3f02c39..2c1209b9251407d8e26cefa7adc5e50f47971d40 100644
+--- a/codex-rs/tui/src/chatwidget/goal_status.rs
++++ b/codex-rs/tui/src/chatwidget/goal_status.rs
+@@ -23,6 +23,13 @@ impl GoalStatusState {
+         self.goal.status == AppThreadGoalStatus::Active
+     }
+ 
++    pub(super) fn is_same_active_goal(&self, goal: &AppThreadGoal) -> bool {
++        self.is_active()
++            && goal.status == AppThreadGoalStatus::Active
++            && self.goal.thread_id == goal.thread_id
++            && self.goal.created_at == goal.created_at
++    }
++
+     pub(super) fn indicator(
+         &self,
+         now: Instant,
+diff --git a/codex-rs/tui/src/chatwidget/safety_recourse.rs b/codex-rs/tui/src/chatwidget/safety_recourse.rs
+index 8126459a265f36f2664885a1a1b66bdbd5fbba5a..96c9b618ebd42ba038d011ed03ed4bad78736968 100644
+--- a/codex-rs/tui/src/chatwidget/safety_recourse.rs
++++ b/codex-rs/tui/src/chatwidget/safety_recourse.rs
+@@ -19,6 +19,10 @@ pub(super) struct PendingRecourse {
+ pub(super) fn on_metadata(chat: &mut ChatWidget, notification: TurnModerationMetadataNotification) {
+     if !chat.turn_lifecycle.agent_turn_running
+         || !matches_turn(chat, &notification.thread_id, &notification.turn_id)
++        || chat
++            .current_goal_status
++            .as_ref()
++            .is_some_and(GoalStatusState::is_active)
+         || chat.side_conversation_active()
+         || chat.config_ref().ephemeral
+         || chat.blocks_direct_input
+@@ -74,6 +78,13 @@ pub(super) fn render_failure(
+     pending: Option<PendingRecourse>,
+     error: &TurnError,
+ ) -> bool {
++    if chat
++        .current_goal_status
++        .as_ref()
++        .is_some_and(GoalStatusState::is_active)
++    {
++        return false;
++    }
+     let Some(pending) = pending else {
+         return false;
+     };
+diff --git a/codex-rs/tui/src/chatwidget/session_flow.rs b/codex-rs/tui/src/chatwidget/session_flow.rs
+index 5bd2a515f54d32cd3080b028137a4597c8c9f828..ecc663c1788dad1d498c5c03cedb0e90d0a21ba7 100644
+--- a/codex-rs/tui/src/chatwidget/session_flow.rs
++++ b/codex-rs/tui/src/chatwidget/session_flow.rs
+@@ -143,6 +143,7 @@ impl ChatWidget {
+         self.thread_name = session.thread_name.clone();
+         self.current_goal_status_indicator = None;
+         self.current_goal_status = None;
++        self.active_goal_cyber_policy_picker_shown = false;
+         self.update_collaboration_mode_indicator();
+         self.forked_from = session.forked_from_id;
+         self.current_rollout_path = session.rollout_path.clone();
+diff --git a/codex-rs/tui/src/chatwidget/settings.rs b/codex-rs/tui/src/chatwidget/settings.rs
+index 81a70ea8599c4bc9ccea12bbdbc2655b71c909be..a5056418d85894cfd338ebb129a229d4cb452af3 100644
+--- a/codex-rs/tui/src/chatwidget/settings.rs
++++ b/codex-rs/tui/src/chatwidget/settings.rs
+@@ -148,6 +148,7 @@ impl ChatWidget {
+             if !enabled {
+                 self.current_goal_status_indicator = None;
+                 self.current_goal_status = None;
++                self.active_goal_cyber_policy_picker_shown = false;
+                 self.turn_lifecycle.goal_status_active_turn_started_at = None;
+                 self.turn_lifecycle.budget_limited_turn_ids.clear();
+                 self.update_collaboration_mode_indicator();
+@@ -729,9 +730,17 @@ impl ChatWidget {
+         if !self.config.features.enabled(Feature::Goals) {
+             self.current_goal_status_indicator = None;
+             self.current_goal_status = None;
++            self.active_goal_cyber_policy_picker_shown = false;
+             self.update_collaboration_mode_indicator();
+             return;
+         }
++        if !self
++            .current_goal_status
++            .as_ref()
++            .is_some_and(|current| current.is_same_active_goal(&goal))
++        {
++            self.active_goal_cyber_policy_picker_shown = false;
++        }
+         if goal.status == AppThreadGoalStatus::BudgetLimited
+             && let Some(turn_id) = turn_id
+         {
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+index fdc8c4758b219fbf90cc10298cf7db41f80eb60d..4d7310f1360bc77bee6aca8e9992287fc81521f3 100644
+--- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+@@ -139,6 +139,101 @@ async fn app_server_cyber_policy_error_renders_dedicated_notice() {
+     assert!(!rendered.contains("server fallback message"));
+ }
+ 
++#[tokio::test]
++async fn active_goal_cyber_policy_picker_shows_once_without_pausing_continuation() {
++    let (mut chat, mut events, _ops) = make_chatwidget_manual_with_auth(
++        Some("gpt-5.6-sol"),
++        /*has_chatgpt_account*/ true,
++        /*has_codex_backend_auth*/ true,
++        FrameRequester::test_dummy(),
++    )
++    .await;
++    chat.set_feature_enabled(Feature::CliDaybreak, /*enabled*/ true);
++    chat.set_feature_enabled(Feature::Goals, /*enabled*/ true);
++    let thread_id = ThreadId::new();
++    chat.thread_id = Some(thread_id);
++    update_thread_goal(&mut chat, thread_id, AppThreadGoalStatus::Active);
++
++    let mut model = crate::test_support::TEST_MODEL_PRESETS[0].clone();
++    model.model = "gpt-5.6-sol".into();
++    model.available_access_programs = Some(codex_protocol::openai_models::ModelAccessPrograms {
++        daybreak_availability: Default::default(),
++        cyber: vec![codex_protocol::turn_input::CyberAccessProgram::DaybreakBlue],
++    });
++    chat.model_catalog = std::sync::Arc::new(ModelCatalog::new(vec![model]));
++
++    handle_turn_started(&mut chat, "goal-turn");
++    handle_error(
++        &mut chat,
++        "server fallback message",
++        Some(CodexErrorInfo::CyberPolicy),
++    );
++
++    let cells = drain_insert_history(&mut events);
++    assert!(
++        cells
++            .iter()
++            .map(|lines| lines_to_single_string(lines))
++            .any(|rendered| rendered.contains("This content can’t be shown"))
++    );
++    assert!(!chat.bottom_pane.no_modal_or_popup_active());
++    assert!(!chat.input_queue.suppress_queue_autosend);
++
++    chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
++    assert!(chat.bottom_pane.no_modal_or_popup_active());
++
++    handle_turn_started(&mut chat, "goal-turn-2");
++    handle_error(
++        &mut chat,
++        "server fallback message",
++        Some(CodexErrorInfo::CyberPolicy),
++    );
++    assert!(chat.bottom_pane.no_modal_or_popup_active());
++    assert!(!chat.input_queue.suppress_queue_autosend);
++}
++
++#[tokio::test]
++async fn active_goal_cyber_policy_with_daybreak_enabled_does_not_pause_continuation() {
++    let (mut chat, mut events, _ops) = make_chatwidget_manual_with_auth(
++        Some("gpt-5.6-sol"),
++        /*has_chatgpt_account*/ true,
++        /*has_codex_backend_auth*/ true,
++        FrameRequester::test_dummy(),
++    )
++    .await;
++    chat.set_feature_enabled(Feature::CliDaybreak, /*enabled*/ true);
++    chat.set_feature_enabled(Feature::Goals, /*enabled*/ true);
++    let thread_id = ThreadId::new();
++    chat.thread_id = Some(thread_id);
++    update_thread_goal(&mut chat, thread_id, AppThreadGoalStatus::Active);
++
++    let mut model = crate::test_support::TEST_MODEL_PRESETS[0].clone();
++    model.model = "gpt-5.6-sol".into();
++    model.available_access_programs = Some(codex_protocol::openai_models::ModelAccessPrograms {
++        daybreak_availability: Default::default(),
++        cyber: vec![codex_protocol::turn_input::CyberAccessProgram::DaybreakBlue],
++    });
++    chat.model_catalog = std::sync::Arc::new(ModelCatalog::new(vec![model]));
++    chat.daybreak_enabled = true;
++
++    handle_turn_started(&mut chat, "goal-turn");
++    handle_error(
++        &mut chat,
++        "server fallback message",
++        Some(CodexErrorInfo::CyberPolicy),
++    );
++
++    let cells = drain_insert_history(&mut events);
++    assert!(
++        cells
++            .iter()
++            .map(|lines| lines_to_single_string(lines))
++            .any(|rendered| rendered.contains("Daybreak is on"))
++    );
++    assert!(chat.bottom_pane.no_modal_or_popup_active());
++    assert!(!chat.input_queue.suppress_queue_autosend);
++}
++
+ #[tokio::test]
+ async fn daybreak_refusal_offers_enable_for_the_next_turn() {
+     let (mut chat, mut events, mut ops) = make_chatwidget_manual_with_auth(
+diff --git a/codex-rs/tui/src/chatwidget/turn_runtime.rs b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+index c27757ec2f651b2226e0a56fe4031e84c991b5f5..abc71d5a7ff9e59432c04b7cc05a2681a6506bdd 100644
+--- a/codex-rs/tui/src/chatwidget/turn_runtime.rs
++++ b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+@@ -439,14 +439,22 @@ impl ChatWidget {
+ 
+     pub(super) fn on_cyber_policy_error(&mut self) {
+         let notice = self.cyber_policy_notice();
++        let active_goal_continuing = self
++            .current_goal_status
++            .as_ref()
++            .is_some_and(GoalStatusState::is_active);
+         self.input_queue.submit_pending_steers_after_interrupt = false;
+         self.finalize_turn();
+         self.add_to_history(history_cell::new_cyber_policy_error_event(notice));
+         if notice == crate::daybreak::Notice::Disabled
+             && !self.thread_usage.replaying_turn_completion
+             && !self.blocks_direct_input
++            && (!active_goal_continuing || !self.active_goal_cyber_policy_picker_shown)
+             && let Some(thread_id) = self.thread_id
+         {
++            if active_goal_continuing {
++                self.active_goal_cyber_policy_picker_shown = true;
++            }
+             self.bottom_pane.show_selection_view(SelectionViewParams {
+                 title: Some("Turn on Daybreak for your next request?".into()),
+                 items: vec![
+@@ -469,7 +477,9 @@ impl ChatWidget {
+                 ],
+                 ..SelectionViewParams::picker()
+             });
+-            self.defer_input_until_settings_applied();
++            if !active_goal_continuing {
++                self.defer_input_until_settings_applied();
++            }
+         }
+         self.request_redraw();
+ 

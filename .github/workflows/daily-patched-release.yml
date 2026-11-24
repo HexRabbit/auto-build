@@ -1,0 +1,297 @@
+name: Daily patched Codex release
+
+on:
+  schedule:
+    # Avoid the top of the hour, when scheduled Actions runs are more likely to queue.
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: Optional stable rust-v* tag to build instead of auto-detecting the latest release
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-patched-codex-release
+  cancel-in-progress: false
+
+env:
+  PATCH_REVISION: "1"
+  PATCH_FILE: patches/goal-cyber-policy-continuation.patch
+
+jobs:
+  detect:
+    name: Detect upstream release
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      should_build: ${{ steps.release.outputs.should_build }}
+      upstream_tag: ${{ steps.release.outputs.upstream_tag }}
+      upstream_sha: ${{ steps.release.outputs.upstream_sha }}
+      release_tag: ${{ steps.release.outputs.release_tag }}
+    steps:
+      - name: Find newest unbuilt stable Codex release
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+
+          upstream_tag="$REQUESTED_TAG"
+          if [[ -z "$upstream_tag" ]]; then
+            upstream_tag="$(
+              git ls-remote --tags --refs https://github.com/openai/codex.git 'refs/tags/rust-v*' \
+                | awk '{ sub("refs/tags/", "", $2); print $2 }' \
+                | grep -E '^rust-v[0-9]+\.[0-9]+\.[0-9]+$' \
+                | sort -V \
+                | tail -1
+            )"
+          fi
+
+          if [[ ! "$upstream_tag" =~ ^rust-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid or missing stable upstream release tag: $upstream_tag" >&2
+            exit 1
+          fi
+
+          release_tag="patched-${upstream_tag}-r${PATCH_REVISION}"
+          if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $release_tag already exists; nothing to build."
+            {
+              echo "should_build=false"
+              echo "upstream_tag=$upstream_tag"
+              echo "upstream_sha="
+              echo "release_tag=$release_tag"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          upstream_sha="$(
+            git ls-remote https://github.com/openai/codex.git "refs/tags/${upstream_tag}^{}" \
+              | awk 'NR == 1 { print $1 }'
+          )"
+          if [[ -z "$upstream_sha" ]]; then
+            upstream_sha="$(
+              git ls-remote https://github.com/openai/codex.git "refs/tags/${upstream_tag}" \
+                | awk 'NR == 1 { print $1 }'
+            )"
+          fi
+          if [[ ! "$upstream_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Could not resolve upstream commit for $upstream_tag" >&2
+            exit 1
+          fi
+
+          {
+            echo "should_build=true"
+            echo "upstream_tag=$upstream_tag"
+            echo "upstream_sha=$upstream_sha"
+            echo "release_tag=$release_tag"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: detect
+    if: needs.detect.outputs.should_build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            jobs: 4
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            jobs: 4
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      TARGET: ${{ matrix.target }}
+      BUILD_JOBS: ${{ matrix.jobs }}
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_RELEASE_LTO: "off"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      CARGO_PROFILE_RELEASE_STRIP: "symbols"
+      CARGO_INCREMENTAL: "0"
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - name: Check out sources and apply continuation patch
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.detect.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+
+          source_dir="${RUNNER_TEMP}/codex-upstream"
+          automation_dir="${RUNNER_TEMP}/build-automation"
+          git clone --depth 1 --branch "$UPSTREAM_TAG" \
+            https://github.com/openai/codex.git "$source_dir"
+
+          if [[ "${ACT:-}" == "true" ]]; then
+            automation_dir="$GITHUB_WORKSPACE"
+          else
+            git init "$automation_dir"
+            git -C "$automation_dir" remote add origin \
+              "https://github.com/${GITHUB_REPOSITORY}.git"
+            git -C "$automation_dir" fetch --depth 1 origin "$GITHUB_SHA"
+            git -C "$automation_dir" checkout --detach FETCH_HEAD
+          fi
+
+          patch_path="${automation_dir}/${PATCH_FILE}"
+          git -C "$source_dir" apply --check "$patch_path"
+          git -C "$source_dir" apply "$patch_path"
+          {
+            echo "SOURCE_DIR=$source_dir"
+            echo "CARGO_TARGET_DIR=${RUNNER_TEMP}/codex-cargo-target"
+          } >> "$GITHUB_ENV"
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            binutils libssl-dev pkg-config
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Configure macOS deployment target
+        if: runner.os == 'macOS'
+        shell: bash
+        run: echo "MACOSX_DEPLOYMENT_TARGET=14.0" >> "$GITHUB_ENV"
+
+      - name: Restore Cargo download cache
+        if: env.ACT != 'true'
+        id: cargo-download-cache
+        uses: actions/cache/restore@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-download-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ needs.detect.outputs.upstream_sha }}
+          restore-keys: |
+            cargo-download-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-
+
+      - name: Resolve and fetch Cargo dependencies
+        shell: bash
+        env:
+          STABLE_GIT_COMMIT: ${{ needs.detect.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          cd "${SOURCE_DIR}/codex-rs"
+          # Release tags bump Cargo.toml without rewriting local workspace
+          # package versions in Cargo.lock. Refresh only those local entries.
+          cargo update --workspace
+          cargo fetch --locked --target "$TARGET"
+
+      - name: Save Cargo download cache
+        if: env.ACT != 'true' && steps.cargo-download-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ steps.cargo-download-cache.outputs.cache-primary-key }}
+
+      - name: Build release binary
+        shell: bash
+        env:
+          STABLE_GIT_COMMIT: ${{ needs.detect.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          cd "${SOURCE_DIR}/codex-rs"
+          cargo build --locked --release --target "$TARGET" --bin codex -j "$BUILD_JOBS"
+
+      - name: Package and verify release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="${CARGO_TARGET_DIR}/${TARGET}/release/codex"
+          package_dir="dist/${TARGET}"
+          archive="dist/codex-${TARGET}.tar.gz"
+
+          test -x "$binary"
+          "$binary" --version
+          mkdir -p "$package_dir"
+          cp "$binary" "$package_dir/codex"
+          tar -C "$package_dir" -czf "$archive" codex
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$archive"
+          else
+            shasum -a 256 "$archive"
+          fi
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: codex-${{ matrix.target }}
+          path: dist/codex-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish patched release
+    needs: [detect, build]
+    if: needs.detect.outputs.should_build == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+    steps:
+      - name: Check out build automation
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Download release archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: codex-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum codex-*.tar.gz > SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.detect.outputs.release_tag }}
+          UPSTREAM_TAG: ${{ needs.detect.outputs.upstream_tag }}
+          UPSTREAM_SHA: ${{ needs.detect.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          patch_sha="$(sha256sum "$PATCH_FILE" | awk '{print $1}')"
+
+          notes="$(mktemp)"
+          {
+            echo "Automated patched build of [openai/codex](https://github.com/openai/codex)."
+            echo
+            echo "- Upstream tag: \`${UPSTREAM_TAG}\`"
+            echo "- Upstream commit: \`${UPSTREAM_SHA}\`"
+            echo "- Patch revision: \`${PATCH_REVISION}\`"
+            echo "- Patch SHA-256: \`${patch_sha}\`"
+            echo "- Builder commit: \`${GITHUB_SHA}\`"
+            echo
+            echo "The macOS artifact is unsigned."
+          } > "$notes"
+
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Codex ${UPSTREAM_TAG} patched build r${PATCH_REVISION}" \
+            --notes-file "$notes" \
+            dist/codex-aarch64-unknown-linux-gnu.tar.gz \
+            dist/codex-aarch64-apple-darwin.tar.gz \
+            dist/SHA256SUMS
